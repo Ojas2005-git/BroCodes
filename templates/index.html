@@ -711,8 +711,9 @@
       if (normAngle < -Math.PI) normAngle += Math.PI * 2;
 
       // If angle is pointing Left (approx), flip
-      const isReversed = (Math.abs(normAngle) > Math.PI / 2);
-
+      const angleDeg = ((baseAngle * 180 / Math.PI) % 360 + 360) % 360;
+      const isReversed = angleDeg >= 151 && angleDeg <= 200;
+            
       const chars = text.split('');
       if (isReversed) {
         chars.reverse();
