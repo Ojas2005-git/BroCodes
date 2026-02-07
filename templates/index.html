@@ -123,8 +123,8 @@
 
   <script>
     const BASE_SIZE = {{ canvas_size }};
-    const polygons = {{ polygons | tojson }};
-    const lines = {{ lines | tojson }};
+    const polygonData = {{ polygons | tojson }};
+    const lineData = {{ lines | tojson }};
     const riverName = {{ label_name | tojson }};
     const canvas = document.getElementById("mapCanvas");
     const ctx = canvas.getContext("2d");
@@ -585,7 +585,7 @@
       const padding = fontSize * 0.5;
       const buffer = 150;
 
-      const sortedPolys = polygons.map(transformShape)
+      const sortedPolys = polygonData.map(transformShape)
         .filter(p => p.length > 2)
         .sort((a, b) => polygonArea(b) - polygonArea(a));
 
@@ -607,57 +607,220 @@
         const spine = getDistanceFieldSpine(poly, buffer);
         if (spine.length < 2) return;
 
+        // Calculate cumulative lengths for the spine
+        const lengths = [0];
+        let totalLength = 0;
+        for (let i = 0; i < spine.length - 1; i++) {
+          const d = Math.hypot(spine[i + 1].pt[0] - spine[i].pt[0], spine[i + 1].pt[1] - spine[i].pt[1]);
+          totalLength += d;
+          lengths.push(totalLength);
+        }
+        spine.forEach((s, i) => s.dist = lengths[i]);
+
         // Unified decision on Inside/Outside
         const maxW = Math.max(...spine.map(s => s.width));
         const allInside = maxW > (fontSize + padding * 2);
 
-        const totalSpineLen = pathLength(spine.map(s => s.pt));
         const labelWidth = ctx.measureText(riverName).width;
 
         // density: more labels on zoom out (small zoomScale)
         const densityFactor = 2.0 * zoomScale;
-        const count = Math.min(3, Math.max(1, Math.floor(totalSpineLen / (labelWidth * densityFactor))));
+        const count = Math.min(3, Math.max(1, Math.floor(totalLength / (labelWidth * densityFactor))));
 
         for (let i = 0; i < count; i++) {
           const f = (i + 0.5) / count;
-          const sIdx = Math.floor(spine.length * f);
-          const mid = spine[sIdx];
-
-          let angle = mid.angle;
-          // Strictly follow the flow - no vertical clamping
-          // Just fix readability flip
-          let norm = angle % (Math.PI * 2);
-          if (norm < 0) norm += Math.PI * 2;
-          if (norm > 1.588 && norm < 4.712) angle += Math.PI;
+          // Find center index based on distance, not just index
+          const targetDist = totalLength * f;
+          let sIdx = 0;
+          for (let k = 0; k < lengths.length; k++) {
+            if (lengths[k] >= targetDist) {
+              sIdx = k;
+              break;
+            }
+          }
 
           if (allInside) {
-            drawLabel({ center: mid.pt, angle: angle, color: COLORS.labelInside, size: fontSize, text: riverName });
+            drawCurvedLabel(ctx, riverName, spine, lengths, targetDist, fontSize, COLORS.labelInside, 0);
           } else if (i === 0) {
-            const normal = [Math.sin(angle), -Math.cos(angle)];
-            const shift = mid.width / 2 + fontSize + padding;
-            const outsidePt = [mid.pt[0] + normal[0] * shift, mid.pt[1] + normal[1] * shift];
-            drawLabel({ center: outsidePt, angle: angle, color: COLORS.labelOutside, size: fontSize * 0.9, text: riverName });
+            // Outside label
+            // Determine offset direction based on spine width (buffer) + text height
+            const nav = spine[sIdx]; // center point node
+
+            // Dynamic offset calculation:
+            // We want it OUTSIDE the river width at this point.
+            // spine width is the full width of the channel approx? 
+            // width in spine nodes comes from `maxDist * 2` or `bestD * 2`.
+            // It represents the available width at that point.
+            // So half width is the distance to the bank.
+            const offsetDist = (nav.width / 2) + fontSize * 0.8;
+
+            drawCurvedLabel(ctx, riverName, spine, lengths, targetDist, fontSize * 0.9, COLORS.labelOutside, offsetDist);
           }
         }
       });
     }
 
-    function drawLabel(label) {
-      ctx.save();
-      ctx.translate(label.center[0], label.center[1]);
-      ctx.rotate(label.angle);
+    function getSpinePoint(spine, lengths, dist) {
+      if (dist <= 0) return { pt: spine[0].pt, angle: spine[0].angle };
+      if (dist >= lengths[lengths.length - 1]) {
+        const last = spine[spine.length - 1];
+        return { pt: last.pt, angle: last.angle };
+      }
 
-      // Add subtle shadow for legibility
+      // Binary search or linear scan for segment
+      for (let i = 0; i < lengths.length - 1; i++) {
+        if (dist >= lengths[i] && dist <= lengths[i + 1]) {
+          const t = (dist - lengths[i]) / (lengths[i + 1] - lengths[i]);
+          const p0 = spine[i].pt;
+          const p1 = spine[i + 1].pt;
+          const x = p0[0] + (p1[0] - p0[0]) * t;
+          const y = p0[1] + (p1[1] - p0[1]) * t;
+
+          // Interpolate angle? Or use segment angle?
+          // Using segment angle ensures text flows along the line exactly.
+          // But spine nodes have their own angles (ridge direction).
+          // Let's calculate angle from segment delta for consistency with the path.
+          const angle = Math.atan2(p1[1] - p0[1], p1[0] - p0[0]);
+
+          return { pt: [x, y], angle: angle };
+        }
+      }
+      return { pt: spine[0].pt, angle: 0 };
+    }
+
+    function drawCurvedLabel(ctx, text, spine, lengths, centerDist, fontSize, color, offset) {
+      ctx.save();
+      ctx.font = `bold ${fontSize}px "Inter", sans-serif`;
+      ctx.fillStyle = color;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+
+      // Shadow
       ctx.shadowColor = "rgba(0,0,0,0.3)";
       ctx.shadowBlur = 4;
 
-      ctx.fillStyle = label.color;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.font = `bold ${label.size}px "Inter", sans-serif`;
+      const textWidth = ctx.measureText(text).width;
 
-      // Draw text
-      ctx.fillText(label.text, 0, 0);
+      // Check Readability: Sample angle at center
+      const centerSample = getSpinePoint(spine, lengths, centerDist);
+      let baseAngle = centerSample.angle;
+
+      // Normalize angle to -PI to PI
+      let normAngle = baseAngle % (Math.PI * 2);
+      if (normAngle > Math.PI) normAngle -= Math.PI * 2;
+      if (normAngle < -Math.PI) normAngle += Math.PI * 2;
+
+      // If angle is pointing Left (approx), flip
+      const isReversed = (Math.abs(normAngle) > Math.PI / 2);
+
+      const chars = text.split('');
+      if (isReversed) {
+        chars.reverse();
+      }
+
+      // We calculate start distance relative to the center
+      // If reversed, we are conceptually moving "backwards" visually, 
+      // but if we reversed the string, we can just print L->R relative to the "flipped" path?
+      // No, simpler: 
+      // If Reversed:
+      //   - Rotate 180 (add PI to angle).
+      //   - Offset sign might need flip if we want it on the "same" side physically?
+      //     - Normal = [-sin, cos]. 
+      //     - If Angle += PI, sin changes sign, cos changes sign. Normal flips.
+      //     - So if we want to stay on the same bank, we need to flip offset sign too?
+      //     - Let's test. If offset is positive (right bank presumably), and we flip direction, "Right" becomes "Left" relative to the walker.
+      //     - So yes, flip offset.
+
+      const renderOffset = isReversed ? -offset : offset;
+
+      let currentDistOffset = -textWidth / 2;
+
+      chars.forEach(char => {
+        const charW = ctx.measureText(char).width;
+        const charDist = centerDist + currentDistOffset + charW / 2;
+        currentDistOffset += charW;
+
+        // If reversed, we want to place the first char (which is the last letter) at the "Left" side?
+        // Wait. 
+        // Text: "ABC". Reversed: "CBA".
+        // We want "A" to be Leftmost visually.
+        // If flow is L (<--).
+        // "A" should be at the "end" of the segment (visually Left).
+        // "C" should be at the "start" (visually Right).
+        // Our `charDist` goes from `center - w/2` to `center + w/2`.
+        // If flow is Left:
+        //   `center - w/2` is the "Right" side (upstream/downstream depending).
+        //   `center + w/2` is the "Left" side.
+        // Correct order for "CBA":
+        // C at Right (small dist?), B at Center, A at Left (large dist?).
+        // If we iterate lengths increasing:
+        //   Dist Low -> Dist High.
+        //   Physically moves Right -> Left (on screen).
+        //   So we place "C", then "B", then "A".
+        //   Result: "C B A".
+        //   This reads Left-to-Right as "C B A".
+        //   But we want "A B C".
+        //   So we need "A" at Right (Low Dist), "B" at Center, "C" at Left (High Dist).
+        //   So we should NOT reverse the string if we walk Low->High and flow is Left.
+        //   Wait.
+        //   If flow is Left (<--). P(0) is Right. P(100) is Left.
+        //   Loop `charDist` from 35 to 65.
+        //   i=0: Dist=35 (Right). Place char 'A'.
+        //   i=1: Dist=50. Place char 'B'.
+        //   i=2: Dist=65 (Left). Place char 'C'.
+        //   Result on screen: "A" "B" "C".
+        //   Result reads "ABC".
+        //   So we do NOT reverse the string.
+        //   But we DO rotate the characters 180 degrees so they aren't upside down.
+        //   And we DO flip the offset?
+        //   If offset is +10 (Above/Below?).
+        //   Normal at 0 (Right) is (0, 1) [Down].
+        //   Normal at 180 (Left) is (0, -1) [Up].
+        //   If we flip angle 180, Normal flips.
+        //   If we want the label to stay on the same side, we need to correct.
+        //   Actually, let's keep it simple.
+
+        // Let's stick to standard reversed/flip logic if the user wants it to just Work.
+        // If `isReversed`:
+        //    We want "ABC" to read L->R.
+        //    We just decided that walking 0->100 produces "A".."B".."C" physically R->L on screen?
+        //    Wait.
+        //    P(0) = (100, 0). P(100) = (0, 0).
+        //    Dist 35 is at x=65.
+        //    Dist 65 is at x=35.
+        //    Placing 'A' at Dist 35 => x=65.
+        //    Placing 'B' at Dist 50 => x=50.
+        //    Placing 'C' at Dist 65 => x=35.
+        //    Screen X coords: 65, 50, 35.
+        //    This reads "A..B..C" from Right-to-Left.
+        //    Visually: "C B A".
+        //    So we DO need to reverse the string to "CBA".
+        //    Then:
+        //    'C' at Dist 35 (x=65).
+        //    'B' at Dist 50 (x=50).
+        //    'A' at Dist 65 (x=35).
+        //    Screen X: 65, 50, 35. Order: C, B, A.
+        //    Result visually: "A B C" (Left-to-Right).
+        //    Correct.
+        //    Rotation: Angle is 180 (Left). Text is upright if angle is 0.
+        //    We need to rotate by 180.
+
+        const sample = getSpinePoint(spine, lengths, charDist);
+        let angle = sample.angle;
+        if (isReversed) angle += Math.PI;
+
+        const nx = -Math.sin(angle);
+        const ny = Math.cos(angle);
+
+        const x = sample.pt[0] + nx * renderOffset;
+        const y = sample.pt[1] + ny * renderOffset;
+
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(angle);
+        ctx.fillText(char, 0, 0);
+        ctx.restore();
+      });
 
       ctx.restore();
     }
@@ -667,7 +830,7 @@
 
       // Draw Polygons
       ctx.lineWidth = 2;
-      polygons.forEach(p => {
+      polygonData.forEach(p => {
         const poly = transformShape(p);
         if (!poly.length) return;
 
@@ -685,7 +848,7 @@
       // Draw Lines (if any)
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
-      lines.forEach(l => {
+      lineData.forEach(l => {
         const line = transformShape(l);
         if (!line.length) return;
         ctx.beginPath();
@@ -701,7 +864,7 @@
 
       // Draw debug points
       if (showPoints) {
-        polygons.forEach(p => {
+        polygonData.forEach(p => {
           const poly = transformShape(p);
           poly.forEach((pt, i) => {
             if (pt[0] < -50 || pt[0] > canvas.width + 50 || pt[1] < -50 || pt[1] > canvas.height + 50) return;
