@@ -1,72 +1,781 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>WKT Map Canvas</title>
-    <style>
-      :root {
-        --bg: #f2efe8;
-        --ink: #1d1b16;
-        --accent: #1f7a8c;
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WKT Map Canvas</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f0f4f7;
+      --ink: #1a1a1a;
+      --accent: #1f7a8c;
+      --accent-hover: #165d6b;
+      --panel: rgba(255, 255, 255, 0.85);
+    }
+
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: #fdfbf7;
+      cursor: grab;
+    }
+
+    canvas:active {
+      cursor: grabbing;
+    }
+
+    .controls {
+      position: fixed;
+      right: 24px;
+      bottom: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      background: var(--panel);
+      backdrop-filter: blur(10px);
+      padding: 16px;
+      border-radius: 20px;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+      z-index: 10;
+      transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+
+    .controls:hover {
+      transform: scale(1.02);
+    }
+
+    .controls button {
+      appearance: none;
+      border: 0;
+      padding: 12px 20px;
+      border-radius: 12px;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      white-space: nowrap;
+    }
+
+    .controls button:hover {
+      background: var(--accent-hover);
+      box-shadow: 0 4px 12px rgba(31, 122, 140, 0.3);
+      transform: translateY(-1px);
+    }
+
+    .controls button:active {
+      transform: translateY(0);
+    }
+
+    .controls button.secondary {
+      background: #4a5568;
+    }
+
+    .controls button.secondary:hover {
+      background: #2d3748;
+    }
+
+    .label-status {
+      position: fixed;
+      top: 24px;
+      left: 24px;
+      background: var(--panel);
+      backdrop-filter: blur(10px);
+      padding: 8px 16px;
+      border-radius: 30px;
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: var(--accent);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+      pointer-events: none;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="labelStatus" class="label-status">Labeling Active: ELBE</div>
+  <canvas id="mapCanvas" width="{{ canvas_size }}" height="{{ canvas_size }}"></canvas>
+  <div class="controls">
+    <button id="zoomIn">Zoom in</button>
+    <button id="zoomOut">Zoom out</button>
+    <button id="toggleLabels" class="secondary">Hide labels</button>
+    <button id="togglePoints" class="secondary">Show Points</button>
+  </div>
+
+  <script>
+    const BASE_SIZE = {{ canvas_size }};
+    const polygons = {{ polygons | tojson }};
+    const lines = {{ lines | tojson }};
+    const riverName = {{ label_name | tojson }};
+    const canvas = document.getElementById("mapCanvas");
+    const ctx = canvas.getContext("2d");
+    const zoomInBtn = document.getElementById("zoomIn");
+    const zoomOutBtn = document.getElementById("zoomOut");
+    const toggleLabelsBtn = document.getElementById("toggleLabels");
+
+    const COLORS = {
+      stroke: "#1f7a8c",
+      fill: "#1f7a8c",
+      labelInside: "#ffffff",
+      labelOutside: "#111111",
+    };
+
+    const LABEL_SETTINGS = {
+      fontScale: 0.028,
+      paddingScale: 0.006,
+      visibleAreaThreshold: 0.5,
+      zoomSingleLabelThreshold: 1.6,
+      maxLabels: 3,
+      straightWindowSegments: 7,
+    };
+
+    let zoom = 1;
+    let zoomTarget = 1;
+    let showLabels = true;
+    let showPoints = false;
+    let panX = 0;
+    let panY = 0;
+    let baseScale = 1;
+    let isPanning = false;
+    let panStart = [0, 0];
+    let panOrigin = [0, 0];
+
+    function resizeCanvas() {
+      const { innerWidth, innerHeight } = window;
+      canvas.width = innerWidth;
+      canvas.height = innerHeight;
+      baseScale = Math.min(canvas.width / BASE_SIZE, canvas.height / BASE_SIZE);
+    }
+
+    function transformPoint([x, y]) {
+      const cx = canvas.width / 2;
+      const cy = canvas.height / 2;
+      return [
+        (x - BASE_SIZE / 2) * baseScale * zoom + cx + panX,
+        (y - BASE_SIZE / 2) * baseScale * zoom + cy + panY,
+      ];
+    }
+
+    function transformShape(shape) {
+      return shape.map(transformPoint);
+    }
+
+    function polygonArea(poly) {
+      let area = 0;
+      for (let i = 0; i < poly.length; i += 1) {
+        const [x1, y1] = poly[i];
+        const [x2, y2] = poly[(i + 1) % poly.length];
+        area += x1 * y2 - x2 * y1;
+      }
+      return Math.abs(area) / 2;
+    }
+
+    function boundingBox(poly) {
+      const xs = poly.map((p) => p[0]);
+      const ys = poly.map((p) => p[1]);
+      return {
+        minX: Math.min(...xs),
+        maxX: Math.max(...xs),
+        minY: Math.min(...ys),
+        maxY: Math.max(...ys),
+      };
+    }
+
+    function pointInPolygon(point, poly) {
+      let inside = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const xi = poly[i][0];
+        const yi = poly[i][1];
+        const xj = poly[j][0];
+        const yj = poly[j][1];
+        const intersect =
+          yi > point[1] !== yj > point[1] &&
+          point[0] <
+          ((xj - xi) * (point[1] - yi)) / (yj - yi + 1e-9) + xi;
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    }
+
+    function distancePointToSegment(p, a, b) {
+      const vx = b[0] - a[0];
+      const vy = b[1] - a[1];
+      const wx = p[0] - a[0];
+      const wy = p[1] - a[1];
+      const c1 = vx * wx + vy * wy;
+      if (c1 <= 0) return Math.hypot(wx, wy);
+      const c2 = vx * vx + vy * vy;
+      if (c2 <= c1) return Math.hypot(p[0] - b[0], p[1] - b[1]);
+      const t = c1 / c2;
+      const px = a[0] + t * vx;
+      const py = a[1] + t * vy;
+      return Math.hypot(p[0] - px, p[1] - py);
+    }
+
+    function minDistanceToEdges(point, poly) {
+      let min = Infinity;
+      for (let i = 0; i < poly.length; i += 1) {
+        const a = poly[i];
+        const b = poly[(i + 1) % poly.length];
+        min = Math.min(min, distancePointToSegment(point, a, b));
+      }
+      return min;
+    }
+
+    function principalAxis(poly) {
+      let meanX = 0;
+      let meanY = 0;
+      poly.forEach(([x, y]) => {
+        meanX += x;
+        meanY += y;
+      });
+      meanX /= poly.length;
+      meanY /= poly.length;
+      let covXX = 0;
+      let covXY = 0;
+      let covYY = 0;
+      poly.forEach(([x, y]) => {
+        const dx = x - meanX;
+        const dy = y - meanY;
+        covXX += dx * dx;
+        covXY += dx * dy;
+        covYY += dy * dy;
+      });
+      const angle = 0.5 * Math.atan2(2 * covXY, covXX - covYY);
+      return {
+        angle,
+        axis: [Math.cos(angle), Math.sin(angle)],
+      };
+    }
+
+    function project(point, axis) {
+      return point[0] * axis[0] + point[1] * axis[1];
+    }
+
+    function angleDelta(a, b) {
+      const diff = Math.atan2(Math.sin(b - a), Math.cos(b - a));
+      return Math.abs(diff);
+    }
+
+    function buildSegments(line) {
+      const segments = [];
+      for (let i = 0; i < line.length - 1; i += 1) {
+        const a = line[i];
+        const b = line[i + 1];
+        const dx = b[0] - a[0];
+        const dy = b[1] - a[1];
+        const length = Math.hypot(dx, dy);
+        if (length > 0) {
+          segments.push({
+            index: i,
+            a,
+            b,
+            length,
+            angle: Math.atan2(dy, dx),
+          });
+        }
+      }
+      return segments;
+    }
+
+    function pathLength(points) {
+      let total = 0;
+      for (let i = 0; i < points.length - 1; i += 1) {
+        total += Math.hypot(
+          points[i + 1][0] - points[i][0],
+          points[i + 1][1] - points[i][1]
+        );
+      }
+      return total;
+    }
+
+    function pointAlongPath(points, distance) {
+      let remaining = distance;
+      for (let i = 0; i < points.length - 1; i += 1) {
+        const a = points[i];
+        const b = points[i + 1];
+        const segLength = Math.hypot(b[0] - a[0], b[1] - a[1]);
+        if (remaining <= segLength) {
+          const t = segLength === 0 ? 0 : remaining / segLength;
+          return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        }
+        remaining -= segLength;
+      }
+      return points[points.length - 1];
+    }
+
+    function lineInsideRatio(line, poly) {
+      if (!line.length) return 0;
+      const step = Math.max(1, Math.floor(line.length / 30));
+      let inside = 0;
+      let total = 0;
+      for (let i = 0; i < line.length; i += step) {
+        total += 1;
+        if (pointInPolygon(line[i], poly)) inside += 1;
+      }
+      return total ? inside / total : 0;
+    }
+
+    function pickBestStraightWindow(linesInput, poly) {
+      let best = null;
+      linesInput.forEach((line) => {
+        if (line.length < 3) return;
+        const insideRatio = lineInsideRatio(line, poly);
+        if (insideRatio < 0.35) return;
+
+        const segments = buildSegments(line);
+        if (!segments.length) return;
+
+        const windowSize = Math.min(
+          LABEL_SETTINGS.straightWindowSegments,
+          segments.length
+        );
+        for (let i = 0; i <= segments.length - windowSize; i += 1) {
+          let curvature = 0;
+          let length = 0;
+          for (let j = i; j < i + windowSize; j += 1) {
+            length += segments[j].length;
+            if (j > i) {
+              curvature += angleDelta(segments[j - 1].angle, segments[j].angle);
+            }
+          }
+          curvature = curvature / Math.max(1, windowSize - 1);
+          const candidate = {
+            line,
+            start: segments[i].index,
+            end: segments[i + windowSize - 1].index + 1,
+            length,
+            curvature,
+          };
+          if (
+            !best ||
+            curvature < best.curvature - 0.02 ||
+            (Math.abs(curvature - best.curvature) <= 0.02 &&
+              length > best.length)
+          ) {
+            best = candidate;
+          }
+        }
+      });
+      return best;
+    }
+
+    function windowPoints(window) {
+      return window.line.slice(window.start, window.end + 1);
+    }
+
+    function lineDirection(points) {
+      const start = points[0];
+      const end = points[points.length - 1];
+      const dx = end[0] - start[0];
+      const dy = end[1] - start[1];
+      const length = Math.hypot(dx, dy);
+      if (length === 0) return { angle: 0, dir: [1, 0] };
+      return { angle: Math.atan2(dy, dx), dir: [dx / length, dy / length] };
+    }
+
+    function cross(a, b) {
+      return a[0] * b[1] - a[1] * b[0];
+    }
+
+    function linePolygonSpan(point, dir, poly) {
+      let tPos = Infinity;
+      let tNeg = -Infinity;
+      for (let i = 0; i < poly.length; i += 1) {
+        const a = poly[i];
+        const b = poly[(i + 1) % poly.length];
+        const s = [b[0] - a[0], b[1] - a[1]];
+        const denom = cross(dir, s);
+        if (Math.abs(denom) < 1e-9) continue;
+        const ap = [a[0] - point[0], a[1] - point[1]];
+        const t = cross(ap, s) / denom;
+        const u = cross(ap, dir) / denom;
+
+        if (u > -1e-6 && u < 1 + 1e-6) {
+          // We ignore hits near zero to avoid the starting point
+          if (t > 1e-3 && t < tPos) tPos = t;
+          if (t < -1e-3 && t > tNeg) tNeg = t;
+        }
+      }
+      return { tPos: Number.isFinite(tPos) ? tPos : null, tNeg: Number.isFinite(tNeg) ? tNeg : null };
+    }
+
+    function rectInsidePolygon(center, width, height, angle, poly) {
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const hw = width / 2;
+      const hh = height / 2;
+      const corners = [
+        [-hw, -hh],
+        [hw, -hh],
+        [hw, hh],
+        [-hw, hh],
+      ];
+      return corners.every(([x, y]) =>
+        pointInPolygon(
+          [center[0] + x * cos - y * sin, center[1] + x * sin + y * cos],
+          poly
+        )
+      );
+    }
+
+    function visibleFraction(poly) {
+      const box = boundingBox(poly);
+      const steps = 26;
+      let inside = 0;
+      let visible = 0;
+      for (let i = 0; i <= steps; i += 1) {
+        for (let j = 0; j <= steps; j += 1) {
+          const x = box.minX + ((box.maxX - box.minX) * i) / steps;
+          const y = box.minY + ((box.maxY - box.minY) * j) / steps;
+          const point = [x, y];
+          if (!pointInPolygon(point, poly)) continue;
+          inside += 1;
+          if (
+            x >= 0 &&
+            x <= canvas.width &&
+            y >= 0 &&
+            y <= canvas.height
+          ) {
+            visible += 1;
+          }
+        }
+      }
+      return inside ? visible / inside : 0;
+    }
+
+    function getDistanceFieldSpine(poly, buffer = 150) {
+      if (!poly || poly.length < 3) return [];
+
+      const box = boundingBox(poly);
+      const density = 25;
+
+      const minX = Math.max(-buffer, box.minX);
+      const maxX = Math.min(canvas.width + buffer, box.maxX);
+      const minY = Math.max(-buffer, box.minY);
+      const maxY = Math.min(canvas.height + buffer, box.maxY);
+
+      const stepX = (maxX - minX) / density;
+      const stepY = (maxY - minY) / density;
+
+      let maxDist = 0;
+      let centerPt = null;
+
+      for (let x = minX; x <= maxX; x += stepX) {
+        for (let y = minY; y <= maxY; y += stepY) {
+          const pt = [x, y];
+          if (pointInPolygon(pt, poly)) {
+            let minDistToEdge = 1e9;
+            for (let i = 0; i < poly.length; i++) {
+              const d = distToSegment(pt, poly[i], poly[(i + 1) % poly.length]);
+              if (d < minDistToEdge) minDistToEdge = d;
+            }
+            if (minDistToEdge > maxDist) {
+              maxDist = minDistToEdge;
+              centerPt = pt;
+            }
+          }
+        }
       }
 
-      body {
-        margin: 0;
-        min-height: 100vh;
-        display: grid;
-        place-items: center;
-        background: radial-gradient(circle at top, #ffffff, var(--bg));
-        color: var(--ink);
-        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      if (!centerPt) return [];
+
+      const spine = [];
+      const searchRes = 16;
+      let bestAngle = 0;
+      let maxRidgeD = 0;
+
+      for (let a = 0; a < Math.PI; a += Math.PI / searchRes) {
+        const p1 = [centerPt[0] + Math.cos(a) * 15, centerPt[1] + Math.sin(a) * 15];
+        const p2 = [centerPt[0] - Math.cos(a) * 15, centerPt[1] - Math.sin(a) * 15];
+        if (pointInPolygon(p1, poly) && pointInPolygon(p2, poly)) {
+          let d1 = 1e9, d2 = 1e9;
+          for (let j = 0; j < poly.length; j++) {
+            d1 = Math.min(d1, distToSegment(p1, poly[j], poly[(j + 1) % poly.length]));
+            d2 = Math.min(d2, distToSegment(p2, poly[j], poly[(j + 1) % poly.length]));
+          }
+          if (Math.min(d1, d2) > maxRidgeD) {
+            maxRidgeD = Math.min(d1, d2);
+            bestAngle = a;
+          }
+        }
       }
 
-      .frame {
-        padding: 24px 28px 30px;
-        background: #fff;
-        border-radius: 16px;
-        box-shadow: 0 20px 40px rgba(0, 0, 0, 0.12);
-        text-align: center;
-      }
+      const trace = (dir) => {
+        let curr = centerPt;
+        let currAngle = bestAngle + (dir === -1 ? Math.PI : 0);
 
-      canvas {
-        border: 3px solid var(--ink);
-        display: block;
-        margin: 0 auto 12px;
-        background: #faf7f0;
-      }
+        for (let i = 0; i < 8; i++) {
+          const stepSize = 35;
+          let nextPt = null;
+          let bestD = 0;
+          let bestA = currAngle;
 
-      .subtitle {
-        margin: 0;
-        font-size: 0.95rem;
-        color: #4a463f;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="frame">
-      <canvas id="mapCanvas" width="{{ canvas_size }}" height="{{ canvas_size }}"></canvas>
-      <p class="subtitle">Map title.</p>
-    </div>
+          for (let da = -0.7; da <= 0.7; da += 0.1) {
+            const testA = currAngle + da;
+            const testP = [curr[0] + Math.cos(testA) * stepSize, curr[1] + Math.sin(testA) * stepSize];
+            if (pointInPolygon(testP, poly)) {
+              let dEdge = 1e9;
+              for (let j = 0; j < poly.length; j++) {
+                dEdge = Math.min(dEdge, distToSegment(testP, poly[j], poly[(j + 1) % poly.length]));
+              }
+              if (dEdge > bestD) {
+                bestD = dEdge;
+                nextPt = testP;
+                bestA = testA;
+              }
+            }
+          }
+          if (nextPt && bestD > 3) {
+            spine.push({ pt: nextPt, width: bestD * 2, angle: bestA });
+            curr = nextPt;
+            currAngle = bestA;
+          } else break;
+        }
+      };
 
-    <script>
-      const polygons = {{ polygons | tojson }};
-      const canvas = document.getElementById("mapCanvas");
-      const ctx = canvas.getContext("2d");
+      spine.push({ pt: centerPt, width: maxDist * 2, angle: bestAngle });
+      trace(1);
+      trace(-1);
 
-      ctx.strokeStyle = "#1f7a8c";
-      ctx.lineWidth = 1.5;
+      const first = centerPt;
+      const axis = [Math.cos(bestAngle), Math.sin(bestAngle)];
+      spine.sort((a, b) => {
+        const da = (a.pt[0] - first[0]) * axis[0] + (a.pt[1] - first[1]) * axis[1];
+        const db = (b.pt[0] - first[0]) * axis[0] + (b.pt[1] - first[1]) * axis[1];
+        return da - db;
+      });
 
-      polygons.forEach((poly) => {
+      return spine;
+    }
+
+    function distToSegment(p, a, b) {
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      const l2 = dx * dx + dy * dy;
+      if (l2 === 0) return Math.hypot(p[0] - a[0], p[1] - a[1]);
+      let t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2;
+      t = Math.max(0, Math.min(1, t));
+      return Math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy));
+    }
+
+
+    function placeLabels() {
+      const fontSize = canvas.height * 0.026;
+      ctx.font = `bold ${fontSize}px "Inter", sans-serif`;
+      const padding = fontSize * 0.5;
+      const buffer = 150;
+
+      const sortedPolys = polygons.map(transformShape)
+        .filter(p => p.length > 2)
+        .sort((a, b) => polygonArea(b) - polygonArea(a));
+
+      const visiblePolys = sortedPolys.filter(p => {
+        const box = boundingBox(p);
+        return box.maxX > -buffer && box.minX < canvas.width + buffer &&
+          box.maxY > -buffer && box.minY < canvas.height + buffer;
+      });
+
+      // Zoom dependent density: 1.0 at 1:1, higher zoom = fewer labels
+      const zoomScale = canvas.width / BASE_SIZE;
+
+      visiblePolys.forEach((poly, idx) => {
+        if (idx > 4) return;
+
+        const area = polygonArea(poly);
+        if (area < 500) return;
+
+        const spine = getDistanceFieldSpine(poly, buffer);
+        if (spine.length < 2) return;
+
+        // Unified decision on Inside/Outside
+        const maxW = Math.max(...spine.map(s => s.width));
+        const allInside = maxW > (fontSize + padding * 2);
+
+        const totalSpineLen = pathLength(spine.map(s => s.pt));
+        const labelWidth = ctx.measureText(riverName).width;
+
+        // density: more labels on zoom out (small zoomScale)
+        const densityFactor = 2.0 * zoomScale;
+        const count = Math.min(3, Math.max(1, Math.floor(totalSpineLen / (labelWidth * densityFactor))));
+
+        for (let i = 0; i < count; i++) {
+          const f = (i + 0.5) / count;
+          const sIdx = Math.floor(spine.length * f);
+          const mid = spine[sIdx];
+
+          let angle = mid.angle;
+          // Strictly follow the flow - no vertical clamping
+          // Just fix readability flip
+          let norm = angle % (Math.PI * 2);
+          if (norm < 0) norm += Math.PI * 2;
+          if (norm > 1.588 && norm < 4.712) angle += Math.PI;
+
+          if (allInside) {
+            drawLabel({ center: mid.pt, angle: angle, color: COLORS.labelInside, size: fontSize, text: riverName });
+          } else if (i === 0) {
+            const normal = [Math.sin(angle), -Math.cos(angle)];
+            const shift = mid.width / 2 + fontSize + padding;
+            const outsidePt = [mid.pt[0] + normal[0] * shift, mid.pt[1] + normal[1] * shift];
+            drawLabel({ center: outsidePt, angle: angle, color: COLORS.labelOutside, size: fontSize * 0.9, text: riverName });
+          }
+        }
+      });
+    }
+
+    function drawLabel(label) {
+      ctx.save();
+      ctx.translate(label.center[0], label.center[1]);
+      ctx.rotate(label.angle);
+
+      // Add subtle shadow for legibility
+      ctx.shadowColor = "rgba(0,0,0,0.3)";
+      ctx.shadowBlur = 4;
+
+      ctx.fillStyle = label.color;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.font = `bold ${label.size}px "Inter", sans-serif`;
+
+      // Draw text
+      ctx.fillText(label.text, 0, 0);
+
+      ctx.restore();
+    }
+
+    function drawScene() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw Polygons
+      ctx.lineWidth = 2;
+      polygons.forEach(p => {
+        const poly = transformShape(p);
         if (!poly.length) return;
+
         ctx.beginPath();
         ctx.moveTo(poly[0][0], poly[0][1]);
-        for (let i = 1; i < poly.length; i += 1) {
-          ctx.lineTo(poly[i][0], poly[i][1]);
-        }
+        for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
         ctx.closePath();
+
+        ctx.fillStyle = COLORS.fill;
+        ctx.strokeStyle = COLORS.stroke;
+        ctx.fill();
         ctx.stroke();
       });
-    </script>
-  </body>
+
+      // Draw Lines (if any)
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      lines.forEach(l => {
+        const line = transformShape(l);
+        if (!line.length) return;
+        ctx.beginPath();
+        ctx.moveTo(line[0][0], line[0][1]);
+        for (let i = 1; i < line.length; i++) ctx.lineTo(line[i][0], line[i][1]);
+        ctx.stroke();
+      });
+
+      // Draw Labels
+      if (showLabels) {
+        placeLabels();
+      }
+
+      // Draw debug points
+      if (showPoints) {
+        polygons.forEach(p => {
+          const poly = transformShape(p);
+          poly.forEach((pt, i) => {
+            if (pt[0] < -50 || pt[0] > canvas.width + 50 || pt[1] < -50 || pt[1] > canvas.height + 50) return;
+            ctx.beginPath();
+            ctx.arc(pt[0], pt[1], 3, 0, Math.PI * 2);
+            ctx.fillStyle = "#ff0000";
+            ctx.fill();
+            ctx.fillStyle = "#000";
+            ctx.font = "10px monospace";
+            ctx.fillText(i, pt[0] + 5, pt[1] - 5);
+          });
+        });
+      }
+    }
+
+    function animate() {
+      zoom += (zoomTarget - zoom) * 0.2;
+      if (Math.abs(zoomTarget - zoom) < 0.001) {
+        zoom = zoomTarget;
+      }
+      drawScene();
+      requestAnimationFrame(animate);
+    }
+
+    zoomInBtn.addEventListener("click", () => {
+      zoomTarget = Math.min(4, zoomTarget * 1.2);
+    });
+
+    zoomOutBtn.addEventListener("click", () => {
+      zoomTarget = Math.max(0.4, zoomTarget / 1.2);
+    });
+
+    toggleLabelsBtn.addEventListener("click", () => {
+      showLabels = !showLabels;
+      toggleLabelsBtn.textContent = showLabels ? "Hide labels" : "Show labels";
+      document.getElementById("labelStatus").style.display = showLabels ? "block" : "none";
+    });
+
+    const togglePointsBtn = document.getElementById("togglePoints");
+    togglePointsBtn.addEventListener("click", () => {
+      showPoints = !showPoints;
+      togglePointsBtn.textContent = showPoints ? "Hide Points" : "Show Points";
+    });
+
+    canvas.addEventListener("pointerdown", (event) => {
+      isPanning = true;
+      panStart = [event.clientX, event.clientY];
+      panOrigin = [panX, panY];
+      canvas.setPointerCapture(event.pointerId);
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!isPanning) return;
+      panX = panOrigin[0] + (event.clientX - panStart[0]);
+      panY = panOrigin[1] + (event.clientY - panStart[1]);
+    });
+
+    function stopPan(event) {
+      if (!isPanning) return;
+      isPanning = false;
+      canvas.releasePointerCapture(event.pointerId);
+    }
+
+    canvas.addEventListener("pointerup", stopPan);
+    canvas.addEventListener("pointercancel", stopPan);
+    canvas.addEventListener("pointerleave", stopPan);
+
+    window.addEventListener("resize", () => {
+      resizeCanvas();
+    });
+
+    resizeCanvas();
+    requestAnimationFrame(animate);
+  </script>
+</body>
+
 </html>
